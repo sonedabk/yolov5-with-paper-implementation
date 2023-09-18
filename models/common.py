@@ -881,3 +881,121 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+
+# Attention modules
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, c1, reduction=16):
+        super().__init__()
+        mid_channel = c1 // reduction
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.shared_MLP = nn.Sequential(
+            nn.Linear(in_features=c1, out_features=mid_channel),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(in_features=mid_channel, out_features=c1)
+        )
+        self.act = nn.Sigmoid()
+        #self.act=nn.SiLU()
+    def forward(self, x):
+        avgout = self.shared_MLP(self.avg_pool(x).view(x.size(0),-1)).unsqueeze(2).unsqueeze(3)
+        maxout = self.shared_MLP(self.max_pool(x).view(x.size(0),-1)).unsqueeze(2).unsqueeze(3)
+        return self.act(avgout + maxout)
+        
+class SpatialAttentionModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv2d = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3)
+        self.act = nn.Sigmoid()
+    def forward(self, x):
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.act(self.conv2d(out))
+        return out
+
+class CBAM(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.channel_attention = ChannelAttentionModule(c1)
+        self.spatial_attention = SpatialAttentionModule()
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+
+# End attention modules
+    
+# Implement follow paper: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10346989/pdf/sensors-23-05786.pdf
+class MIRB(nn.Module):
+    def __init__(self, c1, expand, k=1, s=1, act=True):
+        super().__init__()
+        self.CBRin = Conv(c1, c1, k=k, s=s, act=act)
+        self.num_channel_split = int(c1/3)
+
+        expand_each = int(expand / 3)
+
+        self.CBRout = Conv(c1 - self.num_channel_split * 2, c1, k=k, s=s, act=act)
+        self.IR1 = InvertRes(self.num_channel_split, expand_each, nn.ReLU6())
+        self.IR2 = InvertRes(self.num_channel_split, expand_each, nn.ReLU6())
+        self.IR3 = InvertRes(self.num_channel_split, expand_each, nn.ReLU6())
+    def forward(self, x):
+        out = self.CBRin(x)
+        chan1, chan2, chan3, remain = torch.split(out, int(x.size(1)/3), 1)
+
+        out_chan1 = self.IR1(chan1)
+        out_chan2 = self.IR2(chan2)
+        out_chan3 = self.IR3(chan3)
+
+        shortcut = out_chan1 + out_chan2 + out_chan3
+
+        ir_concat = torch.cat((remain, shortcut), 1)
+
+        out = out + self.CBRout(ir_concat)
+
+        return out
+
+class PISPPF(nn.Module):
+    def __init__(self):
+        pass
+    def forward(self, x):
+        pass
+
+class InvertRes(nn.Module):
+    def __init__(self, c1, expand, act=True):
+        super().__init__()
+        self.CBR1 = Conv(c1, c1, k=1, s=1, act=act)
+        self.DWCBR = DWSConv(c1, expand, act=act)
+        self.CBR2 = Conv(expand, c1, k=1, s=1, act=act)
+    def forward(self, x):
+        out = self.CBR1(x)
+        out = self.DWCBR(out)
+        out = self.CBR2(out)
+        out = x + out
+        return out
+
+class C3_CBAM(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        self.c3 = C3(c1, c2, n, shortcut, g, e)
+        self.cbam = CBAM(c2, c2)
+    def forward(self, x):
+        out = self.c3(x)
+        out = self.cbam(out)
+
+        return out
+
+class DWSConv(nn.Module):
+    def __init__(self, c1, c2, k=3, s=1, d=1, act=True):
+        super().__init__()
+        self.depthwise = Conv(c1, c1, k=k, s=s, g=c1, d=d, act=act)
+        self.pointwise = Conv(c1, c2, k=1, s=1, g=1, d=d, act=act)
+
+    def forward(self, x):
+        out = self.depthwise(x)
+        out = self.pointwise(out)
+
+        return out
+
