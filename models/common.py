@@ -958,10 +958,38 @@ class MIRB(nn.Module):
         return out
 
 class PISPPF(nn.Module):
-    def __init__(self):
-        pass
+    def __init__(self, c1, c2, k=[5, 9, 13]):
+        super().__init__()
+        c_ = c1//2
+        self.sbl1 = SBLConv(c1, c_, k=3)
+        self.route1 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=k[0], stride=1, padding=k[0]//2),
+            Involution(c_, c_, 3, 1),
+            SBLConv(c_, c_)
+        )
+        self.route2 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=k[1], stride=1, padding=k[1]//2),
+            Involution(c_, c_, 3, 1),
+            SBLConv(c_, c_)
+        )
+        self.route3 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=k[2], stride=1, padding=k[2]//2),
+            Involution(c_, c_, 3, 1),
+            SBLConv(c_, c_)
+        )
+        self.sbl2 = SBLConv(c_ * 4, c2)
     def forward(self, x):
-        pass
+        out = self.sbl1(x)
+ 
+        route1 = self.route1(out)
+        route2 = self.route2(out)
+        route3 = self.route3(out)
+
+        cat = torch.cat((route1, route2, route3, out), 1)
+        out = self.sbl2(cat)
+
+        return out
+        
 
 class InvertRes(nn.Module):
     def __init__(self, c1, expand, act=True):
@@ -985,6 +1013,43 @@ class C3_CBAM(nn.Module):
         out = self.c3(x)
         out = self.cbam(out)
 
+        return out
+
+class SBLConv(Conv):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1):
+        super().__init__(c1, c2, k=k, s=s, p=p, g=g, d=d, act=nn.LeakyReLU(0.1))
+
+class Involution(nn.Module):
+
+    def __init__(self,c1,c2,kernel_size,stride):
+        super(Involution, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.c1 = c1
+        reduction_ratio = 4
+        self.group_channels = 16
+        self.groups = self.c1 // self.group_channels
+        self.conv1 = Conv(
+            c1, c1 // reduction_ratio,1)
+        self.conv2 = Conv(
+            c1 // reduction_ratio,
+            kernel_size**2 * self.groups,
+        1,1)
+           
+        if stride > 1:
+            self.avgpool = nn.AvgPool2d(stride, stride)
+        self.unfold = nn.Unfold(kernel_size, 1, (kernel_size-1)//2, stride)    
+
+    def forward(self, x):
+        print("INVO IN", x.shape)
+        weight = self.conv2(self.conv1(x if self.stride == 1 else self.avgpool(x)))
+        b, c, h, w = weight.shape
+        weight = weight.view(b, self.groups, self.kernel_size**2, h, w).unsqueeze(2)
+        #out = _involution_cuda(x, weight, stride=self.stride, padding=(self.kernel_size-1)//2)
+        #print("weight shape:",weight.shape)
+        out = self.unfold(x).view(b, self.groups, self.group_channels, self.kernel_size**2, h, w)
+        #print("new out:",(weight*out).shape)
+        out = (weight * out).sum(dim=3).view(b, self.c1, h, w)     
         return out
 
 class DWSConv(nn.Module):
